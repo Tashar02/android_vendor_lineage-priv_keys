@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import multiprocessing as mp
+import shutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -30,6 +31,39 @@ def extract_public_key(key_apex_path: Path, pubkey_output_path: Path):
 
     tool = AvbTool()
     tool.extract_public_key(args)
+
+
+def copy_all_certs_from_android_certs():
+    current_dir = Path.cwd()
+
+    if not CERTS_PATH.exists():
+        return
+
+    for src_file in CERTS_PATH.iterdir():
+        if src_file.is_file() and not src_file.is_symlink():
+            dst_file = current_dir / src_file.name
+            shutil.copy2(src_file, dst_file)
+            print(f"Copied {src_file.name} from ~/.android-certs to current directory")
+
+
+def copy_current_certs_to_android_certs():
+    current_dir = Path.cwd()
+
+    for cert in keys.platform_keys:
+        for ext in ['.pem', '.pk8', '.x509.pem']:
+            src_file = current_dir / f'{cert}{ext}'
+            dst_file = CERTS_PATH / f'{cert}{ext}'
+            if src_file.exists() and not dst_file.exists():
+                shutil.copy2(src_file, dst_file)
+
+    for apex in keys.apex_keys:
+        for ext in ['.pem', '.certificate.override.pk8', '.certificate.override.x509.pem', '.avbpubkey', '.pubkey']:
+            src_file = current_dir / f'{apex}{ext}'
+            dst_file = CERTS_PATH / f'{apex}{ext}'
+            if src_file.exists() and not dst_file.exists():
+                shutil.copy2(src_file, dst_file)
+
+    print("Copied generated certificates to ~/.android-certs")
 
 
 def generate_platform_key(cert: str):
@@ -91,6 +125,9 @@ def generate_platform_key(cert: str):
 
 
 def generate_apex_key(apex: str):
+    if apex == 'com.android.nfcservices':
+        return
+
     key_apex = Path(f'{apex}.pem')
     x509_file = Path(f'{apex}.certificate.override.x509.pem')
     pk8_file = Path(f'{apex}.certificate.override.pk8')
@@ -156,23 +193,95 @@ def generate_apex_key(apex: str):
         pk8_file.write_bytes(pk8_der)
 
 
+def handle_nfc_keys():
+    current_dir = Path.cwd()
+
+    nfcservices_pk8 = current_dir / 'com.android.nfcservices.certificate.override.pk8'
+    nfcservices_x509 = current_dir / 'com.android.nfcservices.certificate.override.x509.pem'
+
+    # Only create symlinks if APEX files exist
+    if not nfcservices_pk8.exists() or not nfcservices_x509.exists():
+        return
+
+    nfc_pk8 = current_dir / 'nfc.pk8'
+    if nfc_pk8.exists():
+        nfc_pk8.unlink()
+    nfc_pk8.symlink_to('com.android.nfcservices.certificate.override.pk8')
+    print("Created symlink: nfc.pk8 -> com.android.nfcservices.certificate.override.pk8")
+
+    nfc_x509 = current_dir / 'nfc.x509.pem'
+    if nfc_x509.exists():
+        nfc_x509.unlink()
+    nfc_x509.symlink_to('com.android.nfcservices.certificate.override.x509.pem')
+    print("Created symlink: nfc.x509.pem -> com.android.nfcservices.certificate.override.x509.pem")
+
+
+def create_symlinks():
+    current_dir = Path.cwd()
+
+    # signed.x509.pem -> releasekey.x509.pem
+    signed_x509 = current_dir / 'signed.x509.pem'
+    releasekey_x509 = current_dir / 'releasekey.x509.pem'
+    if releasekey_x509.exists():
+        if signed_x509.is_symlink():
+            signed_x509.unlink()
+        elif signed_x509.exists():
+            print(f"Warning: {signed_x509} is a regular file, skipping symlink creation")
+        else:
+            signed_x509.symlink_to('releasekey.x509.pem')
+            print("Created symlink: signed.x509.pem -> releasekey.x509.pem")
+
+
+def check_platform_certs_exist():
+    if not CERTS_PATH.exists():
+        return False
+    return all(
+        (CERTS_PATH / f'{cert}.pk8').exists() for cert in keys.platform_keys
+    )
+
+
+def check_apex_certs_exist():
+    if not CERTS_PATH.exists():
+        return False
+    return all(
+        (CERTS_PATH / f'{apex}.certificate.override.pk8').exists()
+        for apex in keys.apex_keys
+    )
+
+
 def generate_keys():
     workers = mp.cpu_count()
+
+    platform_certs_exist = check_platform_certs_exist()
+    apex_certs_exist = check_apex_certs_exist()
+
     CERTS_PATH.mkdir(parents=True, exist_ok=True)
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        platform_futures = [
-            executor.submit(generate_platform_key, cert)
-            for cert in keys.platform_keys
-        ]
-        apex_futures = [
-            executor.submit(generate_apex_key, apex) for apex in keys.apex_keys
-        ]
+    if platform_certs_exist:
+        print("~/.android-certs exists with all platform keys, copying...")
+    else:
+        print("Generating platform keys...")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            platform_futures = [
+                executor.submit(generate_platform_key, cert)
+                for cert in keys.platform_keys
+            ]
+            [future.result() for future in platform_futures]
+        copy_current_certs_to_android_certs()
 
-        platform_results = [future.result() for future in platform_futures]
-        apex_results = [future.result() for future in apex_futures]
-
-    return platform_results, apex_results
+    if apex_certs_exist:
+        print("~/.android-certs exists with all APEX keys, copying...")
+        return [], []
+    else:
+        print("Generating APEX keys...")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            apex_futures = [
+                executor.submit(generate_apex_key, apex)
+                for apex in keys.apex_keys
+            ]
+            apex_results = [future.result() for future in apex_futures]
+        copy_current_certs_to_android_certs()
+        return [], apex_results
 
 
 def generate_android_bp():
@@ -231,7 +340,20 @@ def generate_keys_mk():
 
 
 def main():
+    # First, copy ALL existing files from ~/.android-certs to current dir
+    # This ensures nfc.*, otakey.*, and any other files are present
+    copy_all_certs_from_android_certs()
+
+    # Then generate/copy keys as needed
     generate_keys()
+
+    # Handle nfc symlinks (replace nfc.* with symlinks to APEX files)
+    handle_nfc_keys()
+
+    # Handle signed symlink
+    create_symlinks()
+
+    # Generate build files
     generate_android_bp()
     generate_keys_mk()
 
